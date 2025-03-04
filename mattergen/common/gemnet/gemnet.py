@@ -677,7 +677,7 @@ class GemNetT(torch.nn.Module):
         h = self.atom_emb(atomic_numbers)
         # Merge z and atom embedding
         if z is not None:
-            z_per_atom = z[batch]
+            z_per_atom = z#[batch]
             h = torch.cat([h, z_per_atom], dim=1)
             # Combine all embeddings
             h = self.atom_latent_emb(h)

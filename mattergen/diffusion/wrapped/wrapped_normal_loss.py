@@ -80,7 +80,7 @@ def wrapped_normal_loss(
     """Compute the loss for a wrapped normal distribution.
     Compares the score of the wrapped normal distribution to the score of the score model.
     """
-    assert len(t) == batch_size
+    #assert len(t) == batch_size    #!! TD inpainting
     _, std = corruption.marginal_prob(
         x=torch.zeros((x.shape[0], 1), device=t.device),
         t=t,

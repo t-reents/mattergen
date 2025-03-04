@@ -6,6 +6,7 @@ from typing import Callable, Generic, TypeVar
 import torch
 
 from mattergen.diffusion.corruption.multi_corruption import MultiCorruption, apply
+from mattergen.diffusion.corruption.corruption import maybe_expand
 from mattergen.diffusion.data.batched_data import BatchedData
 from mattergen.diffusion.losses import Loss
 from mattergen.diffusion.model_target import ModelTarget
@@ -149,10 +150,14 @@ class DiffusionModule(torch.nn.Module, Generic[T]):
 
         Returns: sampled timesteps
         """
-        return self.timestep_sampler(
-            batch_size=batch.get_batch_size(),
+        timesteps = self.timestep_sampler(
+            # batch_size=batch['pos'].shape[0],# !! TD inpainting      
+            batch.get_batch_size(),
             device=self._get_device(batch),
         )
+        timesteps = maybe_expand(timesteps, batch.get_batch_idx('pos'), batch['pos'])
+        print(timesteps)
+        return timesteps
 
     def _get_device(self, batch: T) -> torch.device:
         return next(batch[k].device for k in self.corruption.sdes.keys())

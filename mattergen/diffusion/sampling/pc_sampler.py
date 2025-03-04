@@ -178,8 +178,10 @@ class PredictorCorrector(Generic[Diffusable]):
         dt = -torch.tensor((self._max_t - self._eps_t) / (self.N - 1)).to(self._device)
 
         for i in tqdm(range(self.N), miniters=50, mininterval=5):
-            # Set the timestep
-            t = torch.full((batch.get_batch_size(),), timesteps[i], device=self._device)
+            # Set the timestep  
+            batch_size = batch.get_batch_size()
+            batch_size = batch['pos'].shape[0]
+            t = torch.full((batch_size,), timesteps[i], device=self._device)
 
             # Corrector updates.
             if self._correctors:
@@ -193,7 +195,7 @@ class PredictorCorrector(Generic[Diffusable]):
                         broadcast={"t": t, "dt": dt},
                         x=batch,
                         score=score,
-                        batch_idx=self._multi_corruption._get_batch_indices(batch),
+                        batch_idx={'pos': None},#self._multi_corruption._get_batch_indices(batch),
                     )
                     if record:
                         recorded_samples.append(batch.clone().to("cpu"))
@@ -206,12 +208,17 @@ class PredictorCorrector(Generic[Diffusable]):
             predictor_fns = {
                 k: predictor.update_given_score for k, predictor in self._predictors.items()
             }
+
             samples_means = apply(
                 fns=predictor_fns,
                 x=batch,
                 score=score,
                 broadcast=dict(t=t, batch=batch, dt=dt),
-                batch_idx=self._multi_corruption._get_batch_indices(batch),
+                # batch_idx=self._multi_corruption._get_batch_indices(batch)
+                batch_idx={
+                    # 'pos': torch.arange(batch_size, device=self._device, dtype=torch.int64)
+                    'pos': None
+                    },
             )
             if record:
                 recorded_samples.append(batch.clone().to("cpu"))

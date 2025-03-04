@@ -129,12 +129,24 @@ class AncestralSamplingPredictor(Predictor):
         # Previous timestep
         s = t + dt
 
-        alpha_t, sigma_t = sde.mean_coeff_and_std(x=x, t=t, batch_idx=batch_idx, batch=batch)
+        alpha_t, sigma_t = sde.mean_coeff_and_std(
+            x=x, 
+            t=t, 
+            # batch_idx=batch_idx, 
+            batch_idx=batch.get_batch_idx('pos'),
+            batch=batch
+            )
         if batch_idx is None:
             is_time_zero = s <= 0
         else:
             is_time_zero = s[batch_idx] <= 0
-        alpha_s, sigma_s = sde.mean_coeff_and_std(x=x, t=s, batch_idx=batch_idx, batch=batch)
+        alpha_s, sigma_s = sde.mean_coeff_and_std(
+            x=x,
+            t=s,
+            # batch_idx=batch_idx,
+            batch_idx=batch.get_batch_idx('pos'),
+            batch=batch
+            )
         sigma_s[is_time_zero] = 0
 
         # If you are trying to match this up with algebra in papers, it may help to
