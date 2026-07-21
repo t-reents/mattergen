@@ -3,7 +3,7 @@
 
 import io
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -187,6 +187,21 @@ class CrystalGenerator:
     target_compositions_dict: list[dict[str, float]] | None = None
     num_atoms_distribution: str = "ALEX_MP_20"
 
+    # Start the denoising process from these structures (noised to the starting timestep via the
+    # forward marginal, SDEdit-style) instead of from pure prior noise. When set, `num_batches`
+    # is ignored: len(starting_structures) * num_samples_per_structure samples are generated.
+    starting_structures: list[Structure] | None = None
+    num_samples_per_structure: int = 1
+    # Number of leading denoising steps to skip; the noise schedule is unchanged, denoising
+    # starts at step `skip_steps` of the N-step grid. Only valid with `starting_structures`.
+    skip_steps: int = 0
+
+    # Number of denoising steps / noise levels (`N` in the sampling config). If None, the value
+    # from the sampling config is used. Discrete (D3PM) corruptions have their number of noise
+    # levels baked into the model config and the sampler requires the two to match, so setting
+    # this also overrides the model config accordingly (see __post_init__).
+    num_denoising_steps: int | None = None
+
     # Conditional generation
     diffusion_guidance_factor: float = 0.0
     properties_to_condition_on: TargetProperty | None = None
@@ -212,6 +227,21 @@ class CrystalGenerator:
     progress_callback: ProgressCallback | None = None
 
     def __post_init__(self) -> None:
+        assert not (self.starting_structures and self.target_compositions_dict), (
+            "starting_structures and target_compositions_dict are mutually exclusive."
+        )
+        assert self.skip_steps == 0 or self.starting_structures, (
+            "skip_steps > 0 requires starting_structures."
+        )
+        if self.num_denoising_steps is not None:
+            assert (
+                self.num_denoising_steps > 0
+            ), f"num_denoising_steps must be positive, got {self.num_denoising_steps}"
+            assert self.skip_steps < self.num_denoising_steps, (
+                f"skip_steps ({self.skip_steps}) must be smaller than "
+                f"num_denoising_steps ({self.num_denoising_steps})"
+            )
+            self._override_discrete_corruption_steps()
         assert self.num_atoms_distribution in NUM_ATOMS_DISTRIBUTIONS, (
             f"num_atoms_distribution must be one of {list(NUM_ATOMS_DISTRIBUTIONS.keys())}, "
             f"but got {self.num_atoms_distribution}. To add your own distribution, "
@@ -235,6 +265,31 @@ class CrystalGenerator:
                 raise ValueError(
                     "Incompatible sampling config for crystal structure prediction: found atomic_numbers in predictor_partials or corrector_partials. Use the 'csp' sampling config instead, e.g., via --sampling-config-name=csp."
                 )
+
+    def _override_discrete_corruption_steps(self) -> None:
+        """Match the number of noise levels of the discrete (D3PM) corruptions to
+        `num_denoising_steps`.
+
+        D3PM is discrete-time: its number of noise levels comes from the model config and the
+        sampler requires it to equal its own `N` (see `PredictorCorrector.__init__`). The schedule
+        is not part of the checkpoint (it holds no learned parameters), so it is safe to rebuild it
+        with a different number of steps. Models without discrete corruptions (e.g. CSP) need no
+        override.
+        """
+        corruption_key = "lightning_module.diffusion_module.corruption.discrete_corruptions"
+        discrete_corruptions = OmegaConf.select(self.cfg, corruption_key, default=None)
+        if not discrete_corruptions:
+            return
+        overrides = []
+        for field_name in discrete_corruptions:
+            num_steps_key = f"{corruption_key}.{field_name}.d3pm.schedule.num_steps"
+            if OmegaConf.select(self.cfg, num_steps_key, default=None) is not None:
+                overrides.append(f"++{num_steps_key}={self.num_denoising_steps}")
+        if overrides:
+            self.checkpoint_info = replace(
+                self.checkpoint_info,
+                config_overrides=list(self.checkpoint_info.config_overrides) + overrides,
+            )
 
     @property
     def model(self) -> DiffusionLightningModule:
@@ -268,14 +323,20 @@ class CrystalGenerator:
             batch_size=self.batch_size,
             num_batches=self.num_batches,
             target_compositions_dict=self.target_compositions_dict,
+            starting_structures=self.starting_structures,
         )
 
     def get_condition_loader(
         self,
         sampling_config: DictConfig,
         target_compositions_dict: list[dict[str, float]] | None = None,
+        starting_structures: list[Structure] | None = None,
     ) -> ConditionLoader:
         condition_loader_partial = instantiate(sampling_config.condition_loader_partial)
+        if starting_structures is not None:
+            return condition_loader_partial(
+                structures=starting_structures, properties=self.properties_to_condition_on
+            )
         if not target_compositions_dict:
             return condition_loader_partial(properties=self.properties_to_condition_on)
 
@@ -286,6 +347,7 @@ class CrystalGenerator:
         batch_size: int,
         num_batches: int,
         target_compositions_dict: list[dict[str, float]] | None = None,
+        starting_structures: list[Structure] | None = None,
     ) -> DictConfig:
         """
         Create a sampling config from the given parameters.
@@ -296,7 +358,21 @@ class CrystalGenerator:
         else:
             # avoid modifying the original list
             sampling_config_overrides = self.sampling_config_overrides.copy()
-        if not target_compositions_dict:
+        if self.num_denoising_steps is not None:
+            # `eps_t` is defined as 1/N in the sampling configs, so it follows automatically.
+            sampling_config_overrides += [f"sampler_partial.N={self.num_denoising_steps}"]
+        if starting_structures is not None:
+            # `condition_loader_partial` for starting the denoising from given structures
+            # (the structures themselves are passed at call time in `get_condition_loader`).
+            sampling_config_overrides += [
+                "condition_loader_partial._target_=mattergen.common.data.condition_factory.get_structures_condition_loader",
+                f"+condition_loader_partial.num_samples_per_structure={self.num_samples_per_structure}",
+                f"+condition_loader_partial.batch_size={batch_size}",
+                f"sampler_partial.guidance_scale={self.diffusion_guidance_factor}",
+                f"+sampler_partial.skip_steps={self.skip_steps}",
+                "+sampler_partial.start_from_conditioning_data=True",
+            ]
+        elif not target_compositions_dict:
             # Default `condition_loader_partial` is
             # mattergen.common.data.condition_factory.get_number_of_atoms_condition_loader
             sampling_config_overrides += [
@@ -353,14 +429,29 @@ class CrystalGenerator:
         batch_size: int | None = None,
         num_batches: int | None = None,
         target_compositions_dict: list[dict[str, float]] | None = None,
+        starting_structures: list[Structure] | None = None,
         output_dir: str = "outputs",
     ) -> list[Structure]:
-        # Prioritize the runtime provided batch_size, num_batches and target_compositions_dict
+        """Generate structures.
+
+        When `starting_structures` is set (here or at construction time), the denoising starts
+        from those structures noised to step `skip_steps` of the noise schedule instead of from
+        pure prior noise, and `num_batches` is ignored: the number of generated samples is
+        len(starting_structures) * num_samples_per_structure, in input order
+        (sample j of structure i at index i * num_samples_per_structure + j).
+        """
+        # Prioritize the runtime provided batch_size, num_batches, target_compositions_dict
+        # and starting_structures
         batch_size = batch_size or self.batch_size
         num_batches = num_batches or self.num_batches
         target_compositions_dict = target_compositions_dict or self.target_compositions_dict
+        starting_structures = starting_structures or self.starting_structures
+        assert not (starting_structures and target_compositions_dict), (
+            "starting_structures and target_compositions_dict are mutually exclusive."
+        )
         assert batch_size is not None
-        assert num_batches is not None
+        # num_batches is ignored in starting_structures mode (the loader is iterated to exhaustion)
+        assert num_batches is not None or starting_structures is not None
 
         # print config for debugging and reproducibility
         print("\nModel config:")
@@ -370,11 +461,14 @@ class CrystalGenerator:
             batch_size=batch_size,
             num_batches=num_batches,
             target_compositions_dict=target_compositions_dict,
+            starting_structures=starting_structures,
         )
 
         print("\nSampling config:")
         print(OmegaConf.to_yaml(sampling_config, resolve=True))
-        condition_loader = self.get_condition_loader(sampling_config, target_compositions_dict)
+        condition_loader = self.get_condition_loader(
+            sampling_config, target_compositions_dict, starting_structures
+        )
 
         sampler_partial = instantiate(sampling_config.sampler_partial)
         sampler = sampler_partial(pl_module=self.model)

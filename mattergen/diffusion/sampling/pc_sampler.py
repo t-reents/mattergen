@@ -36,6 +36,8 @@ class PredictorCorrector(Generic[Diffusable]):
         N: int,
         eps_t: float = 1e-3,
         max_t: float | None = None,
+        skip_steps: int = 0,
+        start_from_conditioning_data: bool = False,
     ):
         """
         Args:
@@ -47,6 +49,13 @@ class PredictorCorrector(Generic[Diffusable]):
             N: number of noise levels
             eps_t: diffusion time to stop denoising at
             max_t: diffusion time to start denoising at. If None, defaults to the maximum diffusion time. You may want to start at T-0.01, say, for numerical stability.
+            skip_steps: number of leading denoising steps to skip; the timestep grid is unchanged,
+                denoising starts at step `skip_steps` of the grid. Requires `start_from_conditioning_data=True`.
+            start_from_conditioning_data: if True, instead of sampling the initial state from the prior,
+                noise the conditioning data to the starting timestep via the forward marginal q(x_t | x_0)
+                (SDEdit-style). Only fields that have a predictor or corrector are noised; all other fields
+                are taken unchanged from the conditioning data. Requires conditioning data that contains
+                actual values (e.g., pos/cell/atomic_numbers of real structures) for the noised fields.
         """
         self._diffusion_module = diffusion_module
         self.N = N
@@ -81,6 +90,13 @@ class PredictorCorrector(Generic[Diffusable]):
         self._eps_t = eps_t
         self._n_steps_corrector = n_steps_corrector
         self._device = device
+        assert 0 <= skip_steps < N, f"skip_steps must be in [0, N), got {skip_steps} with N={N}"
+        assert skip_steps == 0 or start_from_conditioning_data, (
+            "skip_steps > 0 requires start_from_conditioning_data=True; starting the reverse "
+            "process midway from pure prior noise is not meaningful."
+        )
+        self._skip_steps = skip_steps
+        self._start_from_conditioning_data = start_from_conditioning_data
 
     @property
     def diffusion_module(self) -> DiffusionModule:
@@ -153,7 +169,22 @@ class PredictorCorrector(Generic[Diffusable]):
         mask = mask or {}
         conditioning_data = conditioning_data.to(self._device)
         mask = {k: v.to(self._device) for k, v in mask.items()}
-        batch = _sample_prior(self._multi_corruption, conditioning_data, mask=mask)
+        if self._start_from_conditioning_data:
+            # Same grid as in _denoise; t_start is the time of the first executed reverse step.
+            timesteps = torch.linspace(self._max_t, self._eps_t, self.N, device=self._device)
+            batch = _sample_noised_conditioning_data(
+                multi_corruption=self._multi_corruption,
+                conditioning_data=conditioning_data,
+                mask=mask,
+                fields_to_noise=[
+                    k
+                    for k in self._multi_corruption.corrupted_fields
+                    if k in self._predictors or k in self._correctors
+                ],
+                t_start=timesteps[self._skip_steps],
+            )
+        else:
+            batch = _sample_prior(self._multi_corruption, conditioning_data, mask=mask)
         return self._denoise(batch=batch, mask=mask, record=record)
 
     @torch.no_grad()
@@ -177,7 +208,7 @@ class PredictorCorrector(Generic[Diffusable]):
         timesteps = torch.linspace(self._max_t, self._eps_t, self.N, device=self._device)
         dt = -torch.tensor((self._max_t - self._eps_t) / (self.N - 1)).to(self._device)
 
-        for i in tqdm(range(self.N), miniters=50, mininterval=5):
+        for i in tqdm(range(self._skip_steps, self.N), miniters=50, mininterval=5):
             # Set the timestep
             t = torch.full((batch.get_batch_size(),), timesteps[i], device=self._device)
 
@@ -255,6 +286,37 @@ def _mask(*, old_x: torch.Tensor, new_x: torch.Tensor, mask: torch.Tensor | None
         return new_x
     else:
         return new_x.lerp(old_x, mask)
+
+
+def _sample_noised_conditioning_data(
+    multi_corruption: MultiCorruption,
+    conditioning_data: BatchedData,
+    mask: Mapping[str, torch.Tensor] | None,
+    fields_to_noise: list[str],
+    t_start: torch.Tensor,
+) -> BatchedData:
+    """SDEdit-style initial state: noise only `fields_to_noise` to time `t_start` via the forward
+    marginal q(x_t | x_0); all other fields pass through unchanged from `conditioning_data`.
+    Note: deliberately restricted to the fields that will be denoised, unlike
+    `MultiCorruption.sample_marginal`, which would noise every corrupted field of the model.
+    """
+    assert len(fields_to_noise) > 0, "No fields to noise; check predictor/corrector config."
+    t = torch.full(
+        (conditioning_data.get_batch_size(),),
+        t_start,
+        device=conditioning_data[fields_to_noise[0]].device,
+    )
+    samples = apply(
+        fns={k: multi_corruption.corruptions[k].sample_marginal for k in fields_to_noise},
+        broadcast=dict(t=t, batch=conditioning_data),
+        x=conditioning_data,
+        batch_idx={k: conditioning_data.get_batch_idx(field_name=k) for k in fields_to_noise},
+    )
+    mask = mask or {}
+    for k, msk in mask.items():
+        if k in samples:
+            samples[k].lerp_(conditioning_data[k], msk)
+    return conditioning_data.replace(**samples)
 
 
 def _sample_prior(

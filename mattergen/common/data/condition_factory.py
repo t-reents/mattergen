@@ -5,15 +5,19 @@ from functools import partial
 from typing import Callable, Iterable, Sequence
 
 import torch
+from pymatgen.core.structure import Structure
 from torch.utils.data import DataLoader, Dataset
 
 from mattergen.common.data.chemgraph import ChemGraph
 from mattergen.common.data.collate import collate
 from mattergen.common.data.dataset import NumAtomsCrystalDataset
 from mattergen.common.data.num_atoms_distribution import NUM_ATOMS_DISTRIBUTIONS
-from mattergen.common.data.transform import SetProperty, Transform
+from mattergen.common.data.transform import SetProperty, Transform, symmetrize_lattice
 from mattergen.common.data.types import TargetProperty
-from mattergen.common.utils.data_utils import create_chem_graph_from_composition
+from mattergen.common.utils.data_utils import (
+    create_chem_graph_from_composition,
+    create_chem_graph_from_structure,
+)
 from mattergen.diffusion.data.batched_data import BatchedData
 
 ConditionLoader = Iterable[tuple[BatchedData, dict[str, torch.Tensor]] | None]
@@ -51,6 +55,45 @@ def get_number_of_atoms_condition_loader(
         batch_size=batch_size,
         collate_fn=partial(_collate_fn, collate_fn=collate),
         shuffle=shuffle,
+    )
+
+
+def get_structures_condition_loader(
+    structures: Sequence[Structure],
+    batch_size: int,
+    num_samples_per_structure: int = 1,
+    properties: TargetProperty | None = None,
+    transforms: list[Transform] | None = None,
+) -> ConditionLoader:
+    """
+    Condition loader whose ChemGraphs carry the pos/cell/atomic_numbers of the given structures,
+    for starting the denoising process from existing structures (SDEdit-style) instead of from
+    pure noise. The input cells are used as-is (no primitive/Niggli reduction), up to lattice
+    symmetrization (a pure rotation). Output order: sample j of structure i is at index
+    i * num_samples_per_structure + j.
+    """
+    transforms = list(transforms) if transforms is not None else []
+    # The models are trained on symmetric (polar-decomposed) lattices; symmetrizing rotates the
+    # cell to that form without changing the crystal.
+    transforms.append(symmetrize_lattice)
+    if properties is not None:
+        for k, v in properties.items():
+            transforms.append(SetProperty(k, v))
+
+    dataset_ = []
+    for structure in structures:
+        chemgraph = create_chem_graph_from_structure(structure)
+        for transform in transforms:
+            chemgraph = transform(chemgraph)
+        dataset_.extend([chemgraph] * num_samples_per_structure)
+
+    dataset = ChemGraphlistDataset(dataset_)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=partial(_collate_fn, collate_fn=collate),
+        shuffle=False,
     )
 
 

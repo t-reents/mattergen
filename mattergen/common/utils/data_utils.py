@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import numpy as np
 import torch
-from pymatgen.core import Element
+from pymatgen.core import Element, Structure
 
 from mattergen.common.data.chemgraph import ChemGraph
 from mattergen.common.utils.ocp_graph_utils import radius_graph_pbc as radius_graph_pbc_ocp
@@ -384,6 +384,20 @@ def compute_lattice_polar_decomposition(lattice_matrix: torch.Tensor) -> torch.T
     # symmetrized lattice matrix
     symm_lattice_matrix = P_prime
     return symm_lattice_matrix
+
+
+def create_chem_graph_from_structure(structure: Structure) -> ChemGraph:
+    """Convert a pymatgen Structure to a ChemGraph, preserving the exact cell and sites
+    (no primitive reduction, no Niggli reduction)."""
+    assert structure.is_ordered, "Only ordered structures are supported."
+    num_atoms = torch.tensor(len(structure), dtype=torch.long)
+    return ChemGraph(
+        pos=torch.from_numpy(structure.frac_coords).float() % 1.0,
+        cell=torch.tensor(structure.lattice.matrix, dtype=torch.float).unsqueeze(0),
+        atomic_numbers=torch.tensor([site.specie.Z for site in structure], dtype=torch.long),
+        num_atoms=num_atoms,
+        num_nodes=num_atoms,  # special attribute used for batching in pytorch geometric
+    )
 
 
 def create_chem_graph_from_composition(target_composition_dict: dict[str, float]) -> ChemGraph:
